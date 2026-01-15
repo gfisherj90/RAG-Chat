@@ -28,8 +28,16 @@ function setupEventListeners() {
     chatInput.addEventListener('keypress', (e) => {
         if (e.key === 'Enter') sendMessage();
     });
-    
-    
+
+    // New Chat button
+    const newChatBtn = document.getElementById('newChatBtn');
+    if (newChatBtn) {
+        newChatBtn.addEventListener('click', (e) => {
+            e.preventDefault();
+            createNewSession();
+        });
+    }
+
     // Suggested questions
     document.querySelectorAll('.suggested-item').forEach(button => {
         button.addEventListener('click', (e) => {
@@ -122,10 +130,17 @@ function addMessage(content, type, sources = null, isWelcome = false) {
     let html = `<div class="message-content">${displayContent}</div>`;
     
     if (sources && sources.length > 0) {
+        const sourceLinks = sources.map(source => {
+            if (source.link) {
+                return `<a href="${source.link}" target="_blank" rel="noopener noreferrer" class="source-link">${escapeHtml(source.text)}</a>`;
+            }
+            return `<span class="source-link no-link">${escapeHtml(source.text)}</span>`;
+        }).join('');
+
         html += `
             <details class="sources-collapsible">
                 <summary class="sources-header">Sources</summary>
-                <div class="sources-content">${sources.join(', ')}</div>
+                <div class="sources-content">${sourceLinks}</div>
             </details>
         `;
     }
@@ -147,6 +162,18 @@ function escapeHtml(text) {
 // Removed removeMessage function - no longer needed since we handle loading differently
 
 async function createNewSession() {
+    // Clear backend session if one exists
+    if (currentSessionId) {
+        try {
+            await fetch(`${API_URL}/session/clear`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ session_id: currentSessionId })
+            });
+        } catch (e) {
+            // Ignore errors - cleanup is optional
+        }
+    }
     currentSessionId = null;
     chatMessages.innerHTML = '';
     addMessage('Welcome to the Course Materials Assistant! I can help you with questions about courses, lessons and specific content. What would you like to know?', 'assistant', null, true);
