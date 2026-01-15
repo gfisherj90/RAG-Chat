@@ -1,5 +1,5 @@
 import anthropic
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 
 class AIGenerator:
     """Handles interactions with Anthropic's Claude API for generating responses"""
@@ -8,22 +8,43 @@ class AIGenerator:
     MAX_TOOL_ROUNDS = 2
 
     # Static system prompt to avoid rebuilding on each call
-    SYSTEM_PROMPT = """ You are an AI assistant specialized in course materials and educational content with access to a comprehensive search tool for course information.
+    SYSTEM_PROMPT = """You are an AI assistant specialized in course materials and educational content with access to tools for course information.
 
-Search Tool Usage:
-- Use the search tool **only** for questions about specific course content or detailed educational materials
-- You may use up to 2 tool calls per query if needed for complex questions requiring multiple searches
-- After receiving tool results, you can make additional tool calls if needed to gather complete information
-- Synthesize all search results into accurate, fact-based responses
-- If search yields no results, state this clearly without offering alternatives
+Available Tools:
+1. **search_course_content**: Search within course lesson content for specific topics or details
+2. **get_course_outline**: Get the complete structure of a course including course title, course link, and all lessons with their numbers and titles
+
+Tool Selection:
+- Use **get_course_outline** for:
+  - Questions about course structure, syllabus, or outline
+  - "What lessons are in [course]?"
+  - "What is the outline of [course]?"
+  - "What topics does [course] cover?"
+  - When you need the course link or lesson list
+  - Always include the course title, course link, and full lesson list (number and title) in your response
+
+- Use **search_course_content** for:
+  - Questions about specific content within lessons
+  - "What does [course] say about [topic]?"
+  - Detailed information from course materials
+
+Sequential Tool Usage:
+- You may use up to 2 tool calls per query when needed
+- For multi-step questions, use tools sequentially:
+  1. First call: gather initial information (e.g., get course outline to find lesson titles)
+  2. Second call: use that information for a refined search (e.g., search for content related to a specific lesson topic)
+- After receiving tool results, evaluate if additional information is needed before providing your final answer
+- Example: "Find courses similar to lesson 4 of MCP" → first get MCP outline → then search for that topic
+
+Tool Usage Guidelines:
+- Synthesize all tool results into accurate, fact-based responses
+- If a tool yields no results, state this clearly without offering alternatives
 
 Response Protocol:
-- **General knowledge questions**: Answer using existing knowledge without searching
-- **Course-specific questions**: Search first, then answer
-- **No meta-commentary**:
- - Provide direct answers only — no reasoning process, search explanations, or question-type analysis
- - Do not mention "based on the search results"
-
+- **General knowledge questions**: Answer using existing knowledge without tools
+- **Course-specific questions**: Use appropriate tool first, then answer
+- **No meta-commentary**: Provide direct answers only — no reasoning process or tool explanations
+- **After tool results**: Always provide a complete response based on the information gathered
 
 All responses must be:
 1. **Brief, Concise and focused** - Get to the point quickly
@@ -61,64 +82,77 @@ Provide only the direct answer to what was asked.
         Returns:
             Generated response as string
         """
-        # Build system content efficiently
-        system_content = (
-            f"{self.SYSTEM_PROMPT}\n\nPrevious conversation:\n{conversation_history}"
-            if conversation_history
-            else self.SYSTEM_PROMPT
-        )
-
-        # Initialize messages with user query
+        # Initialize context
+        system_content = self._build_system_content(conversation_history)
         messages = [{"role": "user", "content": query}]
-
-        # Prepare API call parameters
-        api_params = {
-            **self.base_params,
-            "messages": messages,
-            "system": system_content
-        }
-
-        # Add tools if available
-        if tools:
-            api_params["tools"] = tools
-            api_params["tool_choice"] = {"type": "auto"}
+        api_params = self._build_api_params(messages, system_content, tools)
 
         # Tool calling loop - up to MAX_TOOL_ROUNDS iterations
-        for _ in range(self.MAX_TOOL_ROUNDS):
+        for round_num in range(self.MAX_TOOL_ROUNDS):
             response = self.client.messages.create(**api_params)
 
-            # If no tool use requested, return text response
+            # Termination: No tool use requested - return text response
             if response.stop_reason != "tool_use":
                 return self._extract_text(response)
 
-            # If tool use requested but no tool_manager, return any text content
+            # Termination: Tool use requested but no tool_manager
             if not tool_manager:
                 return self._extract_text(response)
 
-            # Execute tools and collect results
-            tool_results = []
-            for content_block in response.content:
-                if content_block.type == "tool_use":
-                    try:
-                        tool_result = tool_manager.execute_tool(
-                            content_block.name,
-                            **content_block.input
-                        )
-                    except Exception as e:
-                        tool_result = f"Tool execution failed: {str(e)}"
-
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": content_block.id,
-                        "content": tool_result
-                    })
+            # Execute tools for this round
+            tool_results = self._execute_round_tools(response, tool_manager)
 
             # Accumulate messages for next round
             messages.append({"role": "assistant", "content": response.content})
             messages.append({"role": "user", "content": tool_results})
             api_params["messages"] = messages
 
-        # Max rounds reached - make final call WITHOUT tools to force text response
+        # Termination: Max rounds reached - force final response without tools
+        return self._force_final_response(messages, system_content)
+
+    def _build_system_content(self, conversation_history: Optional[str]) -> str:
+        """Build system content with optional conversation history."""
+        if conversation_history:
+            return f"{self.SYSTEM_PROMPT}\n\nPrevious conversation:\n{conversation_history}"
+        return self.SYSTEM_PROMPT
+
+    def _build_api_params(self, messages: List[Dict[str, Any]],
+                          system_content: str,
+                          tools: Optional[List]) -> Dict[str, Any]:
+        """Build API parameters with optional tools."""
+        params = {
+            **self.base_params,
+            "messages": messages,
+            "system": system_content
+        }
+        if tools:
+            params["tools"] = tools
+            params["tool_choice"] = {"type": "auto"}
+        return params
+
+    def _execute_round_tools(self, response, tool_manager) -> List[Dict[str, Any]]:
+        """Execute all tool_use blocks in a response and return results."""
+        tool_results = []
+        for content_block in response.content:
+            if content_block.type == "tool_use":
+                try:
+                    tool_result = tool_manager.execute_tool(
+                        content_block.name,
+                        **content_block.input
+                    )
+                except Exception as e:
+                    tool_result = f"Tool execution failed: {str(e)}"
+
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": content_block.id,
+                    "content": tool_result
+                })
+        return tool_results
+
+    def _force_final_response(self, messages: List[Dict[str, Any]],
+                               system_content: str) -> str:
+        """Make final API call without tools to force a text response."""
         final_params = {
             **self.base_params,
             "messages": messages,

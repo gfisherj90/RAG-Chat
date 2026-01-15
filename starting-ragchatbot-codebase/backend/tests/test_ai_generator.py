@@ -1,6 +1,6 @@
 import pytest
 from unittest.mock import Mock, patch, MagicMock
-from backend.ai_generator import AIGenerator
+from ai_generator import AIGenerator
 
 
 class MockContentBlock:
@@ -27,7 +27,7 @@ class MockResponse:
 @pytest.fixture
 def ai_generator():
     """Create AIGenerator with mocked Anthropic client."""
-    with patch('backend.ai_generator.anthropic.Anthropic'):
+    with patch('ai_generator.anthropic.Anthropic'):
         generator = AIGenerator(api_key="test-key", model="test-model")
         return generator
 
@@ -358,3 +358,164 @@ class TestExtractText:
         result = ai_generator._extract_text(response)
 
         assert result == "First text"
+
+
+class TestSequentialToolCallScenarios:
+    """Tests for real-world sequential tool calling scenarios."""
+
+    def test_outline_then_search_flow(self, ai_generator, mock_tool_manager):
+        """Test get_course_outline followed by search_course_content."""
+        tools = [
+            {"name": "get_course_outline", "description": "Get outline"},
+            {"name": "search_course_content", "description": "Search content"}
+        ]
+
+        # First call: get outline
+        outline_response = MockResponse(
+            stop_reason="tool_use",
+            content=[MockContentBlock(
+                "tool_use",
+                tool_id="outline_1",
+                name="get_course_outline",
+                input_data={"course_name": "MCP"}
+            )]
+        )
+        # Second call: search based on outline
+        search_response = MockResponse(
+            stop_reason="tool_use",
+            content=[MockContentBlock(
+                "tool_use",
+                tool_id="search_1",
+                name="search_course_content",
+                input_data={"query": "lesson 4 topic"}
+            )]
+        )
+        # Final answer
+        final_response = MockResponse(
+            stop_reason="end_turn",
+            content=[MockContentBlock("text", text="Based on the MCP course outline and search results...")]
+        )
+
+        mock_tool_manager.execute_tool = Mock(side_effect=[
+            "Course: MCP\nLesson 4: Client Implementation",
+            "Content about client implementation found in other courses"
+        ])
+        ai_generator.client.messages.create = Mock(
+            side_effect=[outline_response, search_response, final_response]
+        )
+
+        result = ai_generator.generate_response(
+            query="Find courses similar to lesson 4 of MCP",
+            tools=tools,
+            tool_manager=mock_tool_manager
+        )
+
+        assert "Based on the MCP course" in result
+        assert ai_generator.client.messages.create.call_count == 3
+        assert mock_tool_manager.execute_tool.call_count == 2
+
+        # Verify first tool was outline, second was search
+        calls = mock_tool_manager.execute_tool.call_args_list
+        assert calls[0][0][0] == "get_course_outline"
+        assert calls[1][0][0] == "search_course_content"
+
+    def test_terminates_early_when_first_tool_provides_answer(self, ai_generator, sample_tools, mock_tool_manager):
+        """Should terminate after one tool call if Claude has enough info."""
+        tool_response = MockResponse(
+            stop_reason="tool_use",
+            content=[MockContentBlock(
+                "tool_use",
+                tool_id="t1",
+                name="search_course_content",
+                input_data={"query": "specific topic"}
+            )]
+        )
+        final_response = MockResponse(
+            stop_reason="end_turn",
+            content=[MockContentBlock("text", text="Found the answer in one search")]
+        )
+        ai_generator.client.messages.create = Mock(side_effect=[tool_response, final_response])
+
+        result = ai_generator.generate_response(
+            query="Simple single-search query",
+            tools=sample_tools,
+            tool_manager=mock_tool_manager
+        )
+
+        assert result == "Found the answer in one search"
+        assert ai_generator.client.messages.create.call_count == 2
+        assert mock_tool_manager.execute_tool.call_count == 1
+
+    def test_tool_results_from_first_round_available_in_second(self, ai_generator, sample_tools, mock_tool_manager):
+        """Verify first round results are included in messages for second round."""
+        mock_tool_manager.execute_tool = Mock(side_effect=["First result", "Second result"])
+
+        round1_response = MockResponse(
+            stop_reason="tool_use",
+            content=[MockContentBlock(
+                "tool_use",
+                tool_id="t1",
+                name="search_course_content",
+                input_data={"query": "first"}
+            )]
+        )
+        round2_response = MockResponse(
+            stop_reason="tool_use",
+            content=[MockContentBlock(
+                "tool_use",
+                tool_id="t2",
+                name="search_course_content",
+                input_data={"query": "second"}
+            )]
+        )
+        final_response = MockResponse(
+            stop_reason="end_turn",
+            content=[MockContentBlock("text", text="Final")]
+        )
+        ai_generator.client.messages.create = Mock(
+            side_effect=[round1_response, round2_response, final_response]
+        )
+
+        ai_generator.generate_response(
+            query="Multi-step query",
+            tools=sample_tools,
+            tool_manager=mock_tool_manager
+        )
+
+        # Check that second API call has first round's tool result
+        second_call_kwargs = ai_generator.client.messages.create.call_args_list[1][1]
+        messages = second_call_kwargs["messages"]
+        first_tool_result = messages[2]["content"][0]["content"]
+        assert first_tool_result == "First result"
+
+        # Check that third (final) call has both tool results
+        third_call_kwargs = ai_generator.client.messages.create.call_args_list[2][1]
+        messages = third_call_kwargs["messages"]
+        # Should have: user, assistant, user(result1), assistant, user(result2)
+        assert len(messages) == 5
+        assert messages[2]["content"][0]["content"] == "First result"
+        assert messages[4]["content"][0]["content"] == "Second result"
+
+
+class TestConversationHistory:
+    """Tests for conversation history handling."""
+
+    def test_conversation_history_included_in_system_prompt(self, ai_generator, sample_tools, mock_tool_manager):
+        """Should include conversation history in system content."""
+        response = MockResponse(
+            stop_reason="end_turn",
+            content=[MockContentBlock("text", text="Follow-up answer")]
+        )
+        ai_generator.client.messages.create = Mock(return_value=response)
+
+        ai_generator.generate_response(
+            query="Follow-up question",
+            conversation_history="User: Hi\nAssistant: Hello!",
+            tools=sample_tools,
+            tool_manager=mock_tool_manager
+        )
+
+        call_kwargs = ai_generator.client.messages.create.call_args[1]
+        assert "Previous conversation:" in call_kwargs["system"]
+        assert "User: Hi" in call_kwargs["system"]
+        assert "Assistant: Hello!" in call_kwargs["system"]
